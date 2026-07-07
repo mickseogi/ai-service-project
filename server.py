@@ -45,7 +45,7 @@ PROBLEM_TYPES = [
 @tool
 def network_diagnosis_tool(question: str) -> str:
     """
-    사용자의 네트워크 장애 질문을 기반으로 문제 유형 1차 분류
+    사용자의 네트워크 장애 질문을 기반으로 문제 유형 분류
     """
     messages = [
         SystemMessage(
@@ -80,6 +80,64 @@ def network_diagnosis_tool(question: str) -> str:
         
     return "UNKNOWN_NETWORK_ISSUE"
 
+
+@tool
+def command_recommendation_tool(problem_type: str) -> List[str]:
+    """
+    네트워크 장애 유형에 따라 사용자가 확인할 수 있는 점검 명령어를 추천한다.
+    """
+    command_map = {
+        "SSH_CONNECTION_FAILED": [
+            "ping <server_ip>",
+            "systemctl status sshd",
+            "ss -tulnp | grep :22",
+            "firewall-cmd --list-all",
+        ],
+        "DHCP_LEASE_FAILED": [
+            "ipconfig /all",
+            "ip addr",
+            "nmcli dev show",
+            "journalctl -u NetworkManager --no-pager",
+        ],
+        "DNS_RESOLUTION_FAILED": [
+            "nslookup google.com",
+            "ping 8.8.8.8",
+            "cat /etc/resolv.conf",
+            "systemd-resolve --status",
+        ],
+        "PING_CONNECTIVITY_CHECK": [
+            "ping <target_ip>",
+            "tracert <target_ip>",
+            "ipconfig /all",
+            "route print",
+        ],
+        "INTERNET_CONNECTION_FAILED": [
+            "ping 8.8.8.8",
+            "nslookup google.com",
+            "ipconfig /all",
+            "tracert google.com",
+        ],
+        "FIREWALL_OR_PORT_BLOCKED": [
+            "firewall-cmd --list-all",
+            "ss -tulnp",
+            "netstat -ano",
+            "telnet <server_ip> <port>",
+        ],
+        "GATEWAY_OR_ROUTING_ISSUE": [
+            "ip route",
+            "route print",
+            "ping <gateway_ip>",
+            "traceroute 8.8.8.8",
+        ],
+        "UNKNOWN_NETWORK_ISSUE": [
+            "ipconfig /all",
+            "ip addr",
+            "ping 8.8.8.8",
+        ],
+    }
+    return command_map.get(problem_type, command_map["UNKNOWN_NETWORK_ISSUE"])
+
+
 @app.get("/api/health")
 async def health():
     return {
@@ -91,6 +149,7 @@ async def health():
 async def chat(req: ChatRequest):
     try:
         diagnosis_type = network_diagnosis_tool.invoke({"question": req.question})
+        recommended_commands = command_recommendation_tool.invoke({"problem_type": diagnosis_type})
         messages = [
             SystemMessage(
                 content=(
@@ -102,6 +161,8 @@ async def chat(req: ChatRequest):
                     f"Network Diagnosis Tool이 분류한 장애 유형은 다음과 같습니다: {diagnosis_type}\n"
                     "반드시 problem_type에는 위 장애 유형을 그대로 사용하세요.\n\n"
                     "응답은 반드시 아래 형식 지침을 따르세요.\n"
+                    f"Command Recommendation Tool이 추천한 명령어는 다음과 같습니다: {recommended_commands}\n"
+                    "반드시 recommended_commands에는 위 명령어 목록을 그대로 사용하세요.\n\n"
                     f"{parser.get_format_instructions()}\n\n"
                     "주의사항:\n"
                     "- 반드시 JSON 형식으로만 답변하세요.\n"
@@ -120,6 +181,7 @@ async def chat(req: ChatRequest):
 
         parsed_result = parser.parse(response.content)
         parsed_result.problem_type = diagnosis_type
+        parsed_result.recommended_commands = recommended_commands
 
         if parsed_result.problem_type == "UNKNOWN_NETWORK_ISSUE":
             answer = (
@@ -141,6 +203,7 @@ async def chat(req: ChatRequest):
             "answer": answer,
             "structured_result": parsed_result.model_dump(),
             "diagnosis_tool_result": diagnosis_type,
+            "command_tool_result": recommended_commands,
             "model": "gpt-4o-mini",
         }
     
