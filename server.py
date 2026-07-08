@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
+from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.output_parsers.pydantic import PydanticOutputParser
 from langchain_core.tools import tool
 from langchain_core.documents import Document
@@ -27,6 +28,7 @@ DOCS_DIR = Path("docs")
 
 class ChatRequest(BaseModel):
     question: str
+    session_id: str = "default"
 
 
 class DiagnosisResult(BaseModel):
@@ -36,6 +38,54 @@ class DiagnosisResult(BaseModel):
     next_question: str = Field(description="추가 진단을 위해 사용자에게 물어볼 다음 질문")
 
 parser = PydanticOutputParser(pydantic_object=DiagnosisResult)
+
+memory_stores: dict[str, InMemoryChatMessageHistory] = {}
+
+
+def get_memory_history(session_id: str) -> InMemoryChatMessageHistory:
+    """
+    session_id별 대화 이력을 가져옴
+    없으면 새로 생성
+    """
+    if session_id not in memory_stores:
+        memory_stores[session_id] = InMemoryChatMessageHistory()
+    return memory_stores[session_id]
+
+
+def messages_to_json(messages: List[BaseMessage]) -> List[dict]:
+    """
+    Langchain Message 객체를 API 응답용 JSON 형태로 반환
+    """
+    return [
+        {
+            "role": message.type,
+            "content": message.content,
+        }
+        for message in messages
+    ]
+
+
+def build_memory_context(messages: List[BaseMessage], max_messages: int = 4, max_content_length: int = 180) -> str:
+    """
+    최근 대화 이력을 LLM 프롬프트에 넣기 좋은 짧은 문자열로 변환
+    """
+    recent_messages = messages[-max_messages:]
+
+    if not recent_messages:
+        return "이전 대화 이력이 없습니다."
+    lines = []
+
+    for message in recent_messages:
+        role = "사용자" if message.type == "human" else "AI"
+        content = message.content
+
+        if len(content) > max_content_length:
+            content = content[:max_content_length] + "..."
+
+        lines.append(f"{role}: {content}")
+
+    return "\n".join(lines)
+
 
 PROBLEM_TYPES = [
     "SSH_CONNECTION_FAILED",
@@ -131,8 +181,8 @@ def load_rag_documents():
         return 0
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=80,
+        chunk_size=700,
+        chunk_overlap=100,
     )
 
     split_documents = text_splitter.split_documents(documents)
@@ -251,7 +301,7 @@ def rag_search_tool(question: str) -> str:
     if not rag_ready:
         return "검색 가능한 RAG 문서가 없습니다."
     
-    documents = rag_store.similarity_search(question, k=3)
+    documents = rag_store.similarity_search(question, k=2)
 
     if not documents:
         return "관련 문서를 찾지 못했습니다."
@@ -268,8 +318,14 @@ def rag_search_tool(question: str) -> str:
     return "\n\n".join(results)
 
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     question: str
+    session_id: str
+    memory_context: str
+    chat_history: List[dict]
+    should_save_memory: bool
+    memory_saved: bool
+    graph_flow: List[str]
     problem_type: str
     recommended_commands: List[str]
     rag_result: str
@@ -279,16 +335,46 @@ class AgentState(TypedDict):
     command_tool_result: List[str]
 
 
+def append_graph_flow(state: AgentState, node_name: str) -> List[str]:
+    """
+    실제 실행된 LangGraph 노드 흐름 기록
+    """
+    current_flow = state.get("graph_flow", ["START"])
+    return current_flow + [node_name]
+
+
+def memory_node(state: AgentState) -> dict:
+    """
+    session_id에 해당하는 이전 대화 이력을 불러오는 노드
+    """
+    session_id = state.get("session_id", "default")
+    history = get_memory_history(session_id)
+    memory_context = build_memory_context(history.messages)
+
+    return{
+        "session_id": session_id,
+        "memory_context": memory_context,
+        "chat_history": messages_to_json(history.messages),
+        "graph_flow": append_graph_flow(state, "memory_node"),
+    }
+
+
+
 def diagnose_node(state: AgentState) -> dict:
     """
-    사용자 질문을 네트워크 장애 유형으로 분류하는 노드
+    사용자 질문과 이전 대화 이력을 기반으로 네트워크 장애 유형을 분류하는 노드
     """
+    diagnosis_input = (
+        f"이전 대화 이력:\n{state.get('memory_context','')}\n\n"
+        f"현재 질문:\n{state['question']}"
+    )
     diagnosis_type = network_diagnosis_tool.invoke(
-        {"question": state["question"]}
+        {"question": diagnosis_input}
     )
     return{
         "problem_type": diagnosis_type,
         "diagnosis_tool_result": diagnosis_type,
+        "graph_flow": append_graph_flow(state, "diagnose_node"),
     }
 
 
@@ -303,13 +389,19 @@ def route_by_problem_type(state: AgentState) -> str:
 
 def rag_node(state: AgentState) -> dict:
     """
-    사용자 질문과 관련된 RAG 문서를 검색하는 노드
+    사용자 질문과 이전 대화 이력을 함께 사용하여 RAG 문서를 검색하는 노드
     """
+    rag_query =(
+        f"이전 대화 이력:\n{state.get('memory_context', '')}\n\n"
+        f"현재 질문:\n{state['question']}\n\n"
+        f"진단 유형:\n{state['problem_type']}"
+    )
     rag_result = rag_search_tool.invoke(
-        {"question": state["question"]}
+        {"question": rag_query}
     )
     return{
         "rag_result": rag_result,
+        "graph_flow": append_graph_flow(state, "conditional_edge:known_problem") + ["rag_node"],
     }
 
 
@@ -323,6 +415,7 @@ def command_node(state: AgentState) -> dict:
     return{
         "recommended_commands": recommended_commands,
         "command_tool_result": recommended_commands,
+        "graph_flow": append_graph_flow(state, "command_node"),
     }
 
 
@@ -336,8 +429,9 @@ async def generate_answer_node(state: AgentState) -> dict:
                 "당신은 네트워크 트러블슈팅을 도와주는 AI Assistant입니다. "
                 "사용자의 네트워크 장애 상황을 듣고 가능한 원인과 다음 확인 단계를 "
                 "쉽고 간단하게 설명하세요. "
-                "아직 Memory는 연결되지 않았으므로 "
+                "Memory를 사용하여 이전 대화 이력을 참고하고, "
                 "LangGraph 기반 진단 흐름과 RAG 검색 결과를 함께 활용합니다.\n\n"
+                f"이전 대화 이력은 다음과 같습니다:\n{state.get('memory_context', '이전 대화 이력이 없습니다.')}\n\n"
                 f"Network Diagnosis Tool이 분류한 장애 유형은 다음과 같습니다: {state['problem_type']}\n"
                 "반드시 problem_type에는 위 장애 유형을 그대로 사용하세요.\n\n"
                 f"Command Recommendation Tool이 추천한 명령어는 다음과 같습니다: {state['recommended_commands']}\n"
@@ -351,6 +445,8 @@ async def generate_answer_node(state: AgentState) -> dict:
                 "- 마크다운 코드블록은 사용하지 마세요.\n"
                 "- recommended_commands에는 실제 점검에 사용할 수 있는 명령어를 넣으세요.\n"
                 "- next_question에는 추가 진단을 위해 사용자에게 물어볼 질문을 넣으세요.\n"
+                "- 이전 대화에서 이미 확인된 정보는 다시 묻지 마세요.\n"
+                "- 사용자가 ping이 된다고 말했거나 방화벽 가능성을 물어보면, 서버 IP보다 SSH 서비스 상태, 포트 리스닝 여부, 방화벽 허용 여부를 우선 질문하세요.\n"
             )
         ),
         HumanMessage(content=state["question"]),
@@ -371,6 +467,8 @@ async def generate_answer_node(state: AgentState) -> dict:
     return {
         "answer": answer,
         "structured_result": parsed_result.model_dump(),
+        "should_save_memory": True,
+        "graph_flow": append_graph_flow(state, "generate_answer_node"),
     }
 
 
@@ -404,17 +502,47 @@ def clarification_node(state: AgentState) -> dict:
         "rag_result": "",
         "answer": answer,
         "structured_result": structured_result.model_dump(),
+        "should_save_memory": False,
+        "graph_flow": append_graph_flow(state, "conditional_edge:clarification") + ["clarification_node"],
     }
+
+
+def save_memory_node(state: AgentState) -> dict:
+    """
+    현재 사용자 질문과 최종 답변을 session memory에 저장하는 노드
+    """
+    session_id = state.get("session_id", "default")
+    history = get_memory_history(session_id)
+
+    if not state.get("should_save_memory", True):
+        return{
+            "chat_history": messages_to_json(history.messages),
+            "memory_saved": False,
+            "graph_flow": append_graph_flow(state, "save_memory_node") + ["END"],
+        }
+
+    history.add_message(HumanMessage(content=state["question"]))
+    history.add_message(AIMessage(content=state.get("answer", "")))
+
+    return{
+        "chat_history": messages_to_json(history.messages),
+        "memory_saved": True,
+        "graph_flow": append_graph_flow(state, "save_memory_node") + ["END"],
+    }
+
 
 workflow = StateGraph(AgentState)
 
+workflow.add_node("memory_node", memory_node)
 workflow.add_node("diagnose_node", diagnose_node)
 workflow.add_node("rag_node", rag_node)
 workflow.add_node("command_node", command_node)
 workflow.add_node("generate_answer_node", generate_answer_node)
 workflow.add_node("clarification_node", clarification_node)
+workflow.add_node("save_memory_node", save_memory_node)
 
-workflow.add_edge(START, "diagnose_node")
+workflow.add_edge(START, "memory_node")
+workflow.add_edge("memory_node", "diagnose_node")
 
 workflow.add_conditional_edges(
     "diagnose_node",
@@ -427,8 +555,9 @@ workflow.add_conditional_edges(
 
 workflow.add_edge("rag_node", "command_node")
 workflow.add_edge("command_node", "generate_answer_node")
-workflow.add_edge("generate_answer_node", END)
-workflow.add_edge("clarification_node", END)
+workflow.add_edge("generate_answer_node", "save_memory_node")
+workflow.add_edge("clarification_node", "save_memory_node")
+workflow.add_edge("save_memory_node", END)
 
 agent_graph = workflow.compile()
 
@@ -446,11 +575,16 @@ async def chat(req: ChatRequest):
         final_state = await agent_graph.ainvoke(
             {
                 "question": req.question,
+                "session_id": req.session_id,
             }
         )
         return{
             "success": True,
             "question": req.question,
+            "session_id": req.session_id,
+            "memory_used": True,
+            "memory_saved": final_state.get("memory_saved", False),
+            "chat_history": final_state.get("chat_history", []),
             "answer": final_state.get("answer", ""),
             "structured_result": final_state.get("structured_result", {}),
             "diagnosis_tool_result": final_state.get(
@@ -464,15 +598,7 @@ async def chat(req: ChatRequest):
             "rag_result": final_state.get("rag_result", ""),
             "rag_document_count": rag_document_count,
             "graph_used": True,
-            "graph_flow": [
-                "START",
-                "diagnose_node",
-                "conditional_edge",
-                "rag_node or clarification_node",
-                "command_node",
-                "generate_answer_node",
-                "END",
-            ],
+            "graph_flow": final_state.get("graph_flow", []),
             "model": "gpt-4o-mini",
         }
         
@@ -483,3 +609,15 @@ async def chat(req: ChatRequest):
             "error": str(e),
         }
 
+
+class ResetMemoryRequest(BaseModel):
+    session_id: str = "default"
+
+@app.post("/api/memory/reset")
+async def reset_memory(req: ResetMemoryRequest):
+    memory_stores.pop(req.session_id, None)
+
+    return{
+        "success": True,
+        "message": f"{req.session_id} 세션 메모리가 초기화되었습니다."
+    }
