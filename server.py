@@ -264,8 +264,25 @@ def build_memory_context(messages: List[BaseMessage], max_messages: int = 4, max
     return "\n".join(lines)
 
 
+def merge_commands(primary_commands: List[str], fallback_commands: List[str], max_items: int = 6) -> List[str]:
+    """
+    LLM/RAG 기반 명령어와 Tool 기반 기본 명령어를 중복 없이 병합
+    """
+    merged = []
+
+    for command in primary_commands + fallback_commands:
+        if command and command not in merged:
+            merged.append(command)
+
+        if len(merged) >= max_items:
+            break
+
+    return merged
+
+
 PROBLEM_TYPES = [
     "SSH_CONNECTION_FAILED",
+    "STATIC_IP_NOT_APPLIED",
     "DHCP_LEASE_FAILED",
     "DNS_RESOLUTION_FAILED",
     "PING_CONNECTIVITY_CHECK",
@@ -328,6 +345,7 @@ def classify_current_input(question: str) -> str:
                 "- 'DNS는 해결했는데 라면 먹고 싶다', 'SSH는 됐고 이제 밥 먹자'처럼 네트워크 문제 종료 후 다른 주제로 넘어가면 GENERAL_CHAT입니다.\n"
                 "- 반대로 'DNS 서버 주소는 어디서 확인해요?', '그 명령어 결과는 어떻게 해석해요?', '포트가 열렸는지 어디서 봐요?'처럼 네트워크 설정 확인 방법이나 결과 해석을 묻는 질문은 VALID_INPUT입니다.\n"
                 "- 짧은 후속 질문이라도 네트워크 점검 방법, 명령어, 설정 위치, 결과 해석을 묻고 있으면 VALID_INPUT입니다.\n"
+                "- '수동 IP가 적용이 안 돼', '설정 파일이 저장되지 않았어', 'manual 설정이 유지되지 않아', '재부팅하면 IP가 바뀌어'처럼 네트워크 설정 적용 문제를 말하면 VALID_INPUT입니다.\n"
                 "- VALID_INPUT은 네트워크 장애 대상, 증상, 명령어 결과, 설정 확인 질문, 오류 메시지 중 하나 이상이 포함된 경우에만 선택하세요.\n"
                 "- 네트워크 장애 정보가 없는 짧은 일반 대화, 장난성 문장, 무관한 질문은 VALID_INPUT으로 분류하지 마세요.\n"
                 "- 예: '테스트', '아무 말', '오늘 뭐 먹지', '그냥 해본 말'처럼 네트워크 증상이나 점검 정보가 없으면 GENERAL_CHAT입니다.\n"
@@ -438,8 +456,8 @@ def load_rag_documents():
         return 0
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=700,
-        chunk_overlap=100,
+        chunk_size=1200,
+        chunk_overlap=150,
     )
 
     split_documents = text_splitter.split_documents(documents)
@@ -468,6 +486,9 @@ def network_diagnosis_tool(question: str) -> str:
                 "- 단순 키워드 포함 여부만 보지 마세요.\n"
                 "- '~문제는 없다', '~는 된다', '~는 아님' 같은 부정 표현을 고려하세요.\n"
                 "- 오타가 있어도 문맥상 의미를 추론하세요. 예: 게이드웨이 → 게이트웨이\n"
+                "- 사용자가 수동 IP, 고정 IP, static IP를 설정했는데 재부팅 후 다른 IP로 바뀐다거나 DHCP IP로 돌아간다고 말하면 STATIC_IP_NOT_APPLIED를 선택하세요.\n"
+                "- 사용자가 수동 IP 설정이 저장되지 않음, NetworkManager profile이 적용되지 않음, manual 설정이 유지되지 않음, 설정 파일 저장/적용 문제를 말하면 STATIC_IP_NOT_APPLIED를 선택하세요.\n"
+                "- STATIC_IP_NOT_APPLIED는 DHCP 서버가 IP를 못 주는 문제가 아니라, 사용자가 의도한 수동 IP 설정이 실제 인터페이스나 connection profile에 적용되지 않는 문제입니다.\n"
                 "- 반드시 아래 목록 중 하나만 출력하세요.\n"
                 "- 설명 문장은 쓰지 말고, 유형 이름만 출력하세요.\n"
                 "- 네트워크 장애와 관련 없거나 분류가 어렵다면 UNKNOWN_NETWORK_ISSUE를 출력하세요.\n\n"
@@ -504,6 +525,15 @@ def command_recommendation_tool(problem_type: str) -> List[str]:
             "systemctl status sshd",
             "ss -tulnp | grep :22",
             "firewall-cmd --list-all",
+        ],
+        "STATIC_IP_NOT_APPLIED": [
+            "nmcli con show",
+            "nmcli con show \"<connection_name>\"",
+            "nmcli dev status",
+            "ip addr",
+            "cat /etc/NetworkManager/system-connections/<connection_name>.nmconnection",
+            "sudo nmcli con reload",
+            "sudo nmcli con down \"<connection_name>\" && sudo nmcli con up \"<connection_name>\"",
         ],
         "DHCP_LEASE_FAILED": [
             "ipconfig /all",
@@ -558,7 +588,7 @@ def rag_search_tool(question: str) -> str:
     if not rag_ready:
         return "검색 가능한 RAG 문서가 없습니다."
     
-    documents = rag_store.similarity_search(question, k=2)
+    documents = rag_store.similarity_search(question, k=4)
 
     if not documents:
         return "관련 문서를 찾지 못했습니다."
@@ -849,7 +879,8 @@ async def generate_answer_node(state: AgentState) -> dict:
                 f"Network Diagnosis Tool이 분류한 장애 유형은 다음과 같습니다: {state['problem_type']}\n"
                 "반드시 problem_type에는 위 장애 유형을 그대로 사용하세요.\n\n"
                 f"Command Recommendation Tool이 추천한 명령어는 다음과 같습니다: {state['recommended_commands']}\n"
-                "반드시 recommended_commands에는 위 명령어 목록을 그대로 사용하세요.\n\n"
+                "위 명령어 목록은 기본 추천 명령어입니다. "
+                "다만 RAG 검색 결과나 사용자 문맥에 더 적합한 명령어가 있으면 recommended_commands에 함께 포함하세요.\n\n"
                 f"RAG Search Tool이 검색한 문서 내용은 다음과 같습니다:\n{state['rag_result']}\n\n"
                 "가능한 원인과 다음 확인 단계는 위 RAG 검색 결과를 참고해서 작성하세요.\n\n"
                 "응답은 반드시 아래 형식 지침을 따르세요.\n"
@@ -873,6 +904,12 @@ async def generate_answer_node(state: AgentState) -> dict:
                 "- JSON 밖에 일반 문장, 설명, 번호 목록을 절대 쓰지 마세요.\n"
                 "- 응답의 첫 글자는 반드시 { 이고 마지막 글자는 반드시 } 여야 합니다.\n"
                 "- user_facing_answer 안에 자연스러운 설명을 넣고, JSON 바깥에는 아무것도 쓰지 마세요.\n"
+                "- 이전 대화에서 새로운 원인 단서가 나오면, 일반적인 체크리스트를 반복하지 말고 그 단서를 중심으로 원인을 좁혀서 답변하세요.\n"
+                "- 사용자가 이미 원인 후보를 말한 경우, 그 원인이 왜 문제가 되는지와 다음 적용/검증 단계를 우선 설명하세요.\n"
+                "- 같은 명령어 목록을 반복하기보다 현재 상황에서 가장 필요한 1~3개 확인만 제안하세요.\n"
+                "- problem_type이 STATIC_IP_NOT_APPLIED이면 DHCP 서버 장애라고 단정하지 말고, 수동 IP 설정이 실제 connection profile에 저장/적용되었는지 우선 확인하세요.\n"
+                "- 수동 IP가 재부팅 후 바뀌는 경우에는 NetworkManager connection profile, ipv4.method manual, 설정 파일 저장 여부, reload/down/up 적용 여부를 중심으로 답변하세요.\n"
+                "- 사용자가 '네트워크 연결은 정상이고 수동 IP만 적용이 안 된다'고 말하면, 일반 DHCP 체크리스트를 반복하지 말고 수동 IP 설정 적용 문제로 좁혀 답변하세요.\n"
             )
         ),
         HumanMessage(content=state["question"]),
@@ -883,7 +920,11 @@ async def generate_answer_node(state: AgentState) -> dict:
     try:
         parsed_result = parser.parse(response.content)
         parsed_result.problem_type = state["problem_type"]
-        parsed_result.recommended_commands = state["recommended_commands"]
+        parsed_result.recommended_commands = merge_commands(
+            primary_commands=parsed_result.recommended_commands,
+            fallback_commands=state.get("recommended_commands", []),
+            max_items=8,
+        )
 
     except Exception as e:
         add_middleware_log(
@@ -917,6 +958,8 @@ async def generate_answer_node(state: AgentState) -> dict:
 
     return {
         "answer": answer,
+        "recommended_commands": parsed_result.recommended_commands,
+        "command_tool_result": parsed_result.recommended_commands,
         "structured_result": parsed_result.model_dump(),
         "should_save_memory": True,
         "graph_flow": append_graph_flow(state, "generate_answer_node"),
